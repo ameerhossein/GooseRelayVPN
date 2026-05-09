@@ -8,7 +8,7 @@ server_config.json
 /goose-client
 /goose-server
 /goose-server-linux
-/bin/
+#/bin/
 /dist/
 /release/
 
