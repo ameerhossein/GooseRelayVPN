@@ -89,7 +89,7 @@ const ClientIDLen = 16
 // batchPool reuses the marshaled-slice scratch and the plaintext header
 // buffer across EncodeBatch calls. Without pooling, each batch allocates two
 // fresh buffers (the plain header + the marshaled-frame slice header), which
-// is meaningful at our drain rate (≤ every 350 ms per worker, 3 workers).
+// is meaningful at our drain rate (≤ every active drain window per worker).
 var (
 	encPlainPool = sync.Pool{New: func() interface{} {
 		buf := make([]byte, 0, 64*1024)

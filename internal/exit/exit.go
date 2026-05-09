@@ -33,7 +33,7 @@ const (
 	// blocking: when YouTube opens 4-6 parallel connections, later SYNs
 	// are delayed by ActiveDrainWindow × (position in queue), easily
 	// pushing total setup time past the player's ~7s abort threshold.
-	ActiveDrainWindow = 350 * time.Millisecond
+	ActiveDrainWindow = 90 * time.Millisecond
 
 	// LongPollWindow is how long the handler holds open a request waiting for
 	// downstream bytes. UrlFetchApp has a practical read timeout of ~10s, so

@@ -60,6 +60,18 @@ func TestRecordScriptStatsFromBody_ParsesValidJSON(t *testing.T) {
 	}
 }
 
+func TestRecordScriptStatsFromBody_MetadataOnlyJSON(t *testing.T) {
+	c := &Client{endpoints: []relayEndpoint{{url: "u1", scriptStatsErrLogged: true}}}
+	body := []byte(`{"ok":true,"version":1,"protocol":1}`)
+	c.recordScriptStatsFromBody(0, "u1", body)
+	if !c.endpoints[0].scriptCountAt.IsZero() {
+		t.Fatalf("scriptCountAt should remain zero when the forwarder omits count")
+	}
+	if c.endpoints[0].scriptStatsErrLogged {
+		t.Fatalf("metadata-only JSON is healthy and should clear the once-log flag")
+	}
+}
+
 func TestRecordScriptStatsFromBody_LegacyTextResponse(t *testing.T) {
 	// Old apps_script/Code.gs returns "GooseRelay forwarder OK" from doGet.
 	// We must not panic, must not record a count, and must flag the once-log.

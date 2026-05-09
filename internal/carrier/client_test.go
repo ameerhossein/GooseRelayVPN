@@ -421,6 +421,38 @@ func TestCarrier_IdleSlotsPerBucket(t *testing.T) {
 	}
 }
 
+func TestCarrier_IdleSlotsAreCappedPerAccount(t *testing.T) {
+	urls := []string{"http://relay/a1", "http://relay/a2", "http://relay/b1", "http://relay/b2"}
+	accounts := []string{"A", "A", "B", "B"}
+	c, err := New(Config{
+		ScriptURLs:         urls,
+		ScriptAccounts:     accounts,
+		AESKeyHex:          testKeyHex,
+		IdleSlotsPerBucket: 1,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	idxA, _, accountA, ok := c.acquireIdlePollEndpoint(false)
+	if !ok || accountA != "A" {
+		t.Fatalf("first idle poll account=%q ok=%v idx=%d, want A", accountA, ok, idxA)
+	}
+	idxB, _, accountB, ok := c.acquireIdlePollEndpoint(false)
+	if !ok || accountB != "B" {
+		t.Fatalf("second idle poll account=%q ok=%v idx=%d, want B", accountB, ok, idxB)
+	}
+	if _, _, _, ok := c.acquireIdlePollEndpoint(false); ok {
+		t.Fatal("third idle poll should be rejected because both account buckets are full")
+	}
+
+	c.releaseIdlePollSlot("A")
+	_, _, accountA2, ok := c.acquireIdlePollEndpoint(false)
+	if !ok || accountA2 != "A" {
+		t.Fatalf("after releasing A, account=%q ok=%v, want A", accountA2, ok)
+	}
+}
+
 // TestCarrier_KickCoalesceDisabled verifies kick() broadcasts immediately
 // when adaptive coalescing is off (default). A worker waiting on the wake
 // channel must observe the broadcast without any added delay.

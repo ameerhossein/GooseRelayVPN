@@ -341,9 +341,9 @@ func TestExit_SYNDialsRunInParallel(t *testing.T) {
 
 	clientID := [frame.ClientIDLen]byte{0xCC}
 	frames := []*frame.Frame{
-		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "a.example:443"},
-		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "b.example:443"},
-		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "c.example:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "192.0.2.1:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "192.0.2.2:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "192.0.2.3:443"},
 	}
 
 	muteLogsForBench(t)
@@ -358,7 +358,7 @@ func TestExit_SYNDialsRunInParallel(t *testing.T) {
 	elapsed := time.Since(t0)
 
 	// Sequential bound = 3 × dialDelay = 1.8 s. Parallel bound ≈ dialDelay = 600 ms.
-	// Plus the ActiveDrainWindow (350 ms) that handleTunnel waits after dialing.
+	// Plus the ActiveDrainWindow that handleTunnel waits after dialing.
 	if elapsed > dialDelay+ActiveDrainWindow+250*time.Millisecond {
 		t.Fatalf("3 SYNs dispatched serially: elapsed=%v (expected ~%v in parallel)",
 			elapsed, dialDelay+ActiveDrainWindow)

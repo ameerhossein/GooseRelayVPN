@@ -113,10 +113,9 @@ type relayEndpoint struct {
 	dailyCount   uint64
 	dailyResetAt time.Time
 
-	// Script-reported per-day invocation count, fetched hourly via doGet on
-	// the same /exec URL. scriptCountAt is zero until the first successful
-	// fetch; scriptStatsErrLogged suppresses repeat "needs redeploy" warnings
-	// when the deployed Code.gs is the legacy version that doesn't return JSON.
+	// Optional script-reported per-day invocation count, fetched hourly via
+	// doGet on the same /exec URL. New forwarders intentionally omit it so
+	// doPost does not write PropertiesService on every tunnel request.
 	scriptCount          uint64
 	scriptCountAt        time.Time
 	scriptStatsErrLogged bool
@@ -163,7 +162,7 @@ type Client struct {
 	numWorkers         int // (workersPerEndpoint + idleSlotsPerBucket - 1) × bucketCount
 	bucketCount        int // distinct account labels in endpoints; unlabeled all share one bucket
 	idleSlotsPerBucket int // resolved from Config.IdleSlotsPerBucket, default 1
-	clientVersion     string
+	clientVersion      string
 
 	// clientID is a random 16-byte identifier minted once per process. It is
 	// embedded in every encrypted batch so the server can route downstream
@@ -184,8 +183,8 @@ type Client struct {
 	endpoints    []relayEndpoint
 	nextEndpoint int
 
-	idlePollMu       sync.Mutex
-	idlePollInFlight int
+	idlePollMu                sync.Mutex
+	idlePollInFlightByAccount map[string]int
 
 	wake  *waker // broadcasts to all idle poll goroutines simultaneously
 	stats clientStats
@@ -289,22 +288,23 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		cfg:                cfg,
-		aead:               aead,
-		httpClients:        NewFrontedClients(cfg.Fronting, pollTimeout, endpoints[0].url),
-		debugTiming:        cfg.DebugTiming,
-		numWorkers:         numWorkers,
-		bucketCount:        bucketCount,
-		idleSlotsPerBucket: idleSlotsPerBucket,
-		clientVersion:      cfg.ClientVersion,
-		clientID:           clientID,
-		sessions:           make(map[[frame.SessionIDLen]byte]*session.Session),
-		inFlight:           make(map[[frame.SessionIDLen]byte]bool),
-		txReady:            make(map[[frame.SessionIDLen]byte]struct{}),
-		endpoints:          endpoints,
-		wake:               newWaker(),
-		coalesceStep:       cfg.CoalesceStep,
-		coalesceMax:        cfg.CoalesceMax,
+		cfg:                       cfg,
+		aead:                      aead,
+		httpClients:               NewFrontedClients(cfg.Fronting, pollTimeout, endpoints[0].url),
+		debugTiming:               cfg.DebugTiming,
+		numWorkers:                numWorkers,
+		bucketCount:               bucketCount,
+		idleSlotsPerBucket:        idleSlotsPerBucket,
+		clientVersion:             cfg.ClientVersion,
+		clientID:                  clientID,
+		sessions:                  make(map[[frame.SessionIDLen]byte]*session.Session),
+		inFlight:                  make(map[[frame.SessionIDLen]byte]bool),
+		txReady:                   make(map[[frame.SessionIDLen]byte]struct{}),
+		endpoints:                 endpoints,
+		idlePollInFlightByAccount: make(map[string]int, bucketCount),
+		wake:                      newWaker(),
+		coalesceStep:              cfg.CoalesceStep,
+		coalesceMax:               cfg.CoalesceMax,
 	}, nil
 }
 
@@ -404,9 +404,9 @@ func (c *Client) Run(ctx context.Context) error {
 		defer wg.Done()
 		c.runStatsLoop(ctx)
 	}()
-	// Hourly fetch of each deployment's self-reported invocation count.
-	// Logged in the next [stats] line as `script=N` next to the existing
-	// client-side `today=N` so the user sees both perspectives.
+	// Hourly fetch of each deployment's metadata and optional self-reported
+	// invocation count. New forwarders omit `script=N`; the client-side
+	// `today=N` counter remains the hot-path quota estimate.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -473,6 +473,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		defer c.releaseInFlight(drainedIDs)
 	}
 	isIdlePoll := len(frames) == 0
+	preselectedEndpoint := -1
+	preselectedScriptURL := ""
+	currentIdleAccount := ""
+	idleSlotHeld := false
+	pureDownload := false
 	if isIdlePoll {
 		// Allow idleSlotsPerBucket idle long-poll slots per *account bucket* so
 		// each Google account's quota gets the configured number of standing
@@ -488,15 +493,19 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		// is the floor that keeps a single-bucket config from regressing to a
 		// single standing poll.
 		c.mu.Lock()
-		idleCap := c.bucketCount * c.idleSlotsPerBucket
-		if len(c.txReady) == 0 && idleCap < pureDownloadIdleCap {
-			idleCap = pureDownloadIdleCap
-		}
+		pureDownload = len(c.txReady) == 0
 		c.mu.Unlock()
-		if !c.acquireIdlePollSlot(idleCap) {
+		var ok bool
+		preselectedEndpoint, preselectedScriptURL, currentIdleAccount, ok = c.acquireIdlePollEndpoint(pureDownload)
+		if !ok {
 			return false
 		}
-		defer c.releaseIdlePollSlot()
+		idleSlotHeld = true
+		defer func() {
+			if idleSlotHeld {
+				c.releaseIdlePollSlot(currentIdleAccount)
+			}
+		}()
 	}
 
 	// Stats: classify poll outcome on return so callers don't have to remember
@@ -530,7 +539,20 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		endpointIdx, scriptURL := c.pickRelayEndpoint()
+		endpointIdx, scriptURL := preselectedEndpoint, preselectedScriptURL
+		if isIdlePoll && attempt > 1 {
+			c.releaseIdlePollSlot(currentIdleAccount)
+			idleSlotHeld = false
+			currentIdleAccount = ""
+			var ok bool
+			endpointIdx, scriptURL, currentIdleAccount, ok = c.acquireIdlePollEndpoint(pureDownload)
+			if !ok {
+				return false
+			}
+			idleSlotHeld = true
+		} else if !isIdlePoll {
+			endpointIdx, scriptURL = c.pickRelayEndpoint()
+		}
 		if endpointIdx < 0 || scriptURL == "" {
 			log.Printf("[carrier] no relay script URLs are configured")
 			return false
@@ -960,21 +982,51 @@ func (c *Client) gcDoneSessions() {
 	}
 }
 
-func (c *Client) acquireIdlePollSlot(cap int) bool {
+func (c *Client) acquireIdlePollEndpoint(pureDownload bool) (int, string, string, bool) {
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
 	c.idlePollMu.Lock()
 	defer c.idlePollMu.Unlock()
-	if c.idlePollInFlight >= cap {
-		return false
+
+	n := len(c.endpoints)
+	if n == 0 {
+		return -1, "", "", false
 	}
-	c.idlePollInFlight++
-	return true
+	now := time.Now()
+	start := c.nextEndpoint % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		ep := &c.endpoints[idx]
+		if ep.blacklistedTill.After(now) {
+			continue
+		}
+		cap := c.idleSlotCapForAccount(pureDownload)
+		if c.idlePollInFlightByAccount[ep.account] >= cap {
+			continue
+		}
+		c.idlePollInFlightByAccount[ep.account]++
+		c.nextEndpoint = (idx + 1) % n
+		return idx, ep.url, ep.account, true
+	}
+	return -1, "", "", false
 }
 
-func (c *Client) releaseIdlePollSlot() {
+func (c *Client) idleSlotCapForAccount(pureDownload bool) int {
+	cap := c.idleSlotsPerBucket
+	if cap <= 0 {
+		cap = 1
+	}
+	if pureDownload && c.bucketCount == 1 && cap < pureDownloadIdleCap {
+		return pureDownloadIdleCap
+	}
+	return cap
+}
+
+func (c *Client) releaseIdlePollSlot(account string) {
 	c.idlePollMu.Lock()
 	defer c.idlePollMu.Unlock()
-	if c.idlePollInFlight > 0 {
-		c.idlePollInFlight--
+	if c.idlePollInFlightByAccount[account] > 0 {
+		c.idlePollInFlightByAccount[account]--
 	}
 }
 

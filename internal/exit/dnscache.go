@@ -104,13 +104,10 @@ func dialWithDNSCache(
 	addrs, lerr := net.DefaultResolver.LookupIPAddr(ctx, host)
 	dnsElapsed := time.Since(dnsStart)
 	if lerr != nil || len(addrs) == 0 {
-		// Fall through to baseDial which will surface the same/similar error.
-		tcpStart := time.Now()
-		conn, derr := baseDial(network, address, timeout)
-		if derr != nil {
-			return nil, derr
+		if lerr != nil {
+			return nil, lerr
 		}
-		return &dialResult{Conn: conn, DNS: dnsElapsed, TCP: time.Since(tcpStart)}, nil
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
 	ip := addrs[0].IP.String()
 	cache.set(host, ip)

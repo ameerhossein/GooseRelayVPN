@@ -73,18 +73,18 @@ func (c *Client) bumpDailyCount(endpointIdx int) {
 
 const (
 	// scriptStatsInterval is how often we GET /exec on each deployment to
-	// read its self-reported daily count. Every 30 minutes adds ~48
-	// invocations/day per deployment — still negligible against the
-	// ~20k/day account budget.
+	// read its metadata and optional self-reported daily count. Every
+	// 30 minutes adds ~48 invocations/day per deployment — still negligible
+	// against the ~20k/day account budget.
 	scriptStatsInterval = 30 * time.Minute
 
 	// scriptStatsInitialDelay lets the carrier warm up before the first
 	// fetch so startup logs aren't interleaved with stats fetches.
 	scriptStatsInitialDelay = 15 * time.Second
 
-	// scriptStatsRequestTimeout caps a single GET. doGet is a fast path
-	// (single PropertiesService read) so a tight timeout is fine and
-	// keeps a hung Apps Script instance from stalling the loop.
+	// scriptStatsRequestTimeout caps a single GET. doGet is a metadata-only
+	// fast path, so a tight timeout is fine and keeps a hung Apps Script
+	// instance from stalling the loop.
 	scriptStatsRequestTimeout = 30 * time.Second
 
 	// scriptStatsMaxBody bounds the response read. The JSON payload is
@@ -98,15 +98,15 @@ const (
 type scriptStatsResponse struct {
 	OK       bool   `json:"ok"`
 	Date     string `json:"date"`
-	Count    int64  `json:"count"`
+	Count    *int64 `json:"count,omitempty"`
 	Version  int    `json:"version"`
 	Protocol int    `json:"protocol"`
 }
 
 // runScriptStatsLoop polls each deployment's doGet endpoint hourly and records
-// the script-reported daily count on the corresponding relayEndpoint. The
-// recorded value is surfaced in the periodic [stats] line as `script=N`. Runs
-// until ctx is canceled.
+// the optional script-reported daily count on the corresponding relayEndpoint.
+// When present, it is surfaced in the periodic [stats] line as `script=N`.
+// Runs until ctx is canceled.
 func (c *Client) runScriptStatsLoop(ctx context.Context) {
 	select {
 	case <-ctx.Done():
@@ -173,7 +173,8 @@ func (c *Client) fetchScriptStats(ctx context.Context, idx int, url string) {
 	c.recordScriptStatsFromBody(idx, url, body)
 }
 
-// recordScriptStatsFromBody parses a doGet response body and stores the count.
+// recordScriptStatsFromBody parses a doGet response body and stores its
+// optional count.
 // Split out from fetchScriptStats so the parsing logic is unit-testable without
 // standing up an HTTP server.
 func (c *Client) recordScriptStatsFromBody(idx int, url string, body []byte) {
@@ -188,10 +189,14 @@ func (c *Client) recordScriptStatsFromBody(idx int, url string, body []byte) {
 	}
 	c.endpointMu.Lock()
 	if idx >= 0 && idx < len(c.endpoints) {
-		c.endpoints[idx].scriptCount = uint64(stats.Count)
-		c.endpoints[idx].scriptCountAt = time.Now()
+		if stats.Count != nil {
+			c.endpoints[idx].scriptCount = uint64(*stats.Count)
+			c.endpoints[idx].scriptCountAt = time.Now()
+		}
 		// On a successful parse, clear the once-flag so a future regression
-		// (operator re-deploys an old version) gets a fresh log line.
+		// (operator re-deploys an old version) gets a fresh log line. New
+		// forwarders intentionally omit count to keep PropertiesService off the
+		// tunnel hot path; that is still a healthy stats response.
 		c.endpoints[idx].scriptStatsErrLogged = false
 	}
 	c.endpointMu.Unlock()
@@ -214,6 +219,6 @@ func (c *Client) logScriptStatsParseErrorOnce(idx int, url string, body []byte) 
 	if len(snippet) > 80 {
 		snippet = snippet[:80] + "..."
 	}
-	log.Printf("[carrier] script stats unavailable for %s — redeploy apps_script/Code.gs to enable per-deployment count reporting (got: %q)",
+	log.Printf("[carrier] script metadata unavailable for %s — redeploy apps_script/Code.gs to enable version/protocol reporting (got: %q)",
 		shortScriptKey(url), snippet)
 }

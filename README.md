@@ -459,7 +459,7 @@ What the client does for you automatically:
 
 If you change `Code.gs` — for example to point at a new VPS IP — you must create a **new deployment** in the Apps Script editor (Deploy → **New deployment**, not just "Manage deployments"). Saving alone does nothing; the live `/exec` URL serves the published version. After redeploying, update `script_keys` in `client_config.json`.
 
-The current `Code.gs` also tracks per-deployment invocation counts and exposes them via `doGet`, along with forwarder/protocol metadata used by the client's pre-flight check. If you have an older deployment, redeploying once enables the `script=N` field in the client's periodic `[stats]` line and avoids version-mismatch warnings.
+The current `Code.gs` exposes only forwarder/protocol metadata via `doGet` for the client's pre-flight check. It intentionally does not update `PropertiesService` on each `doPost`, because that adds latency to every tunnel request. The client-side `today=N` counter in `[stats]` remains the quota estimate.
 
 ---
 

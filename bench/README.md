@@ -41,7 +41,7 @@ into your pre-tag flow when you're ready.
 | `sessions_per_sec` | Open/close churn against quick sink for 10 s | `per_sec` |
 | `idle_overhead_15s` | 50 idle echo connections; sample CPU% every 500 ms | `client_cpu_mean`, `server_cpu_mean` |
 
-Throughput numbers are bounded by `ActiveDrainWindow` (350 ms) — every HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 6 MB/s. Sizes above are tuned so the full suite finishes in ~90 s.
+Throughput numbers are bounded by `ActiveDrainWindow` (90 ms) — every active HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 22 MB/s before Apps Script/network overhead. Sizes above are tuned so the full suite finishes in ~90 s.
 
 ## Layout
 

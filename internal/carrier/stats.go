@@ -103,9 +103,9 @@ func (c *Client) endpointStatsLine() string {
 
 // accountStatsLine returns " accounts=[...]" suffix when at least one
 // endpoint carries an account label, or "" otherwise. Aggregates the daily
-// client-side count and (when available) the script-reported count per
-// account so the operator can directly read each Google account's spend
-// against its ~20k/day quota.
+// client-side count and (when available from older forwarders) the
+// script-reported count per account so the operator can directly read each
+// Google account's spend against its ~20k/day quota.
 //
 // scriptCount aggregation is dedup-by-value, not sum: PropertiesService is
 // per Apps Script project, so multiple deployments of one project all report
