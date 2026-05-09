@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -32,8 +33,9 @@ const frontedProbeOKBody = "GooseRelay forwarder OK"
 // therefore a separate per-domain throttle bucket on the Google CDN. Requests
 // are distributed across clients in round-robin order.
 type FrontingConfig struct {
-	GoogleIP string   // "ip:443"
-	SNIHosts []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
+	GoogleIP      string   // "ip:443"
+	SNIHosts      []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
+	BindInterface string   // optional Linux interface used to keep carrier traffic outside TUN mode
 }
 
 // NewFrontedClients returns one *http.Client per SNI host in cfg.SNIHosts.
@@ -61,13 +63,13 @@ func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL s
 	}
 	clients := make([]*http.Client, len(hosts))
 	for i, sni := range hosts {
-		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout, caches[sni])
+		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout, caches[sni], cfg.BindInterface)
 	}
 	hosts, clients = filterFrontedClientsByProbe(hosts, clients, probeURL)
 	// Best-effort: warm each SNI's TLS session in the background so the
 	// first real poll resumes (saves ~140 ms TLS handshake per cold conn).
 	// Zero Apps Script executions consumed; failures are silently ignored.
-	prewarmFrontedClients(cfg.GoogleIP, hosts, caches)
+	prewarmFrontedClients(cfg.GoogleIP, hosts, caches, cfg.BindInterface)
 	return clients
 }
 
@@ -284,13 +286,13 @@ func logFrontedProbeDecision(results []frontedProbeResult, keep []int) {
 // with a short deadline; the read errors out on deadline but by then the
 // crypto/tls layer has consumed the post-handshake message and stored the
 // ticket in the cache.
-func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string]tls.ClientSessionCache) {
+func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string]tls.ClientSessionCache, bindInterface string) {
 	const (
 		dialTimeout   = 3 * time.Second
 		ticketWindow  = 500 * time.Millisecond
 		overallBudget = 5 * time.Second
 	)
-	dialer := &net.Dialer{Timeout: dialTimeout}
+	dialer := newCarrierDialer(dialTimeout, 0, bindInterface)
 	for _, sni := range sniHosts {
 		go func(sniHost string, cache tls.ClientSessionCache) {
 			ctx, cancel := context.WithTimeout(context.Background(), overallBudget)
@@ -330,8 +332,8 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 
 // newFrontedClient builds a single *http.Client that dials googleIP and
 // presents sniHost in the TLS handshake.
-func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache) *http.Client {
-	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache, bindInterface string) *http.Client {
+	dialer := newCarrierDialer(30*time.Second, 30*time.Second, bindInterface)
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -388,4 +390,21 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 	}
 
 	return &http.Client{Transport: transport, Timeout: pollTimeout}
+}
+
+func newCarrierDialer(timeout, keepAlive time.Duration, bindInterface string) *net.Dialer {
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: keepAlive}
+	if bindInterface == "" {
+		return dialer
+	}
+	dialer.Control = func(network, address string, c syscall.RawConn) error {
+		var controlErr error
+		if err := c.Control(func(fd uintptr) {
+			controlErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, bindInterface)
+		}); err != nil {
+			return err
+		}
+		return controlErr
+	}
+	return dialer
 }

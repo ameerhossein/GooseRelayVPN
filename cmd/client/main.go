@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -135,11 +136,26 @@ func main() {
 	setupClientLogging()
 
 	configPath := flag.String("config", "client_config.json", "path to client config JSON")
+	tunMode := flag.Bool("tun", false, "route system TCP traffic through a TUN interface")
+	tunDNS := flag.String("tun-dns", "1.1.1.1", "DNS server to use while -tun mode is active")
 	flag.Parse()
+
+	if *tunMode {
+		ensureTunPrivileges()
+	}
 
 	cfg, err := config.LoadClient(*configPath)
 	if err != nil {
 		log.Fatalf("%v", err)
+	}
+	carrierBindInterface := ""
+	if *tunMode {
+		defaultRoute, err := currentDefaultRoute()
+		if err != nil {
+			log.Fatalf("tun: detect default route before carrier startup: %v", err)
+		}
+		carrierBindInterface = defaultRoute.Dev
+		log.Printf("[tun] carrier egress pinned to interface %s", defaultRoute.Dev)
 	}
 	log.Printf("[client] GooseRelayVPN client starting")
 	log.Printf("[client] config loaded from %s", *configPath)
@@ -171,8 +187,9 @@ func main() {
 		CoalesceMax:        time.Duration(cfg.CoalesceMaxMs) * time.Millisecond,
 		IdleSlotsPerBucket: cfg.IdleSlotsPerBucket,
 		Fronting: carrier.FrontingConfig{
-			GoogleIP: cfg.GoogleIP,
-			SNIHosts: cfg.SNIHosts,
+			GoogleIP:      cfg.GoogleIP,
+			SNIHosts:      cfg.SNIHosts,
+			BindInterface: carrierBindInterface,
 		},
 	})
 	if err != nil {
@@ -217,6 +234,23 @@ func main() {
 		}
 	}()
 
+	var tunCleanup func()
+	if *tunMode {
+		opts := tunOptions{
+			Name:      defaultTunName,
+			CIDR:      defaultTunCIDR,
+			DNS:       *tunDNS,
+			LogLevel:  defaultTunLogLevel,
+			ManageDNS: true,
+		}
+		cleanup, err := startTunMode(ctx, cfg, opts)
+		if err != nil {
+			log.Fatalf("tun: %v", err)
+		}
+		tunCleanup = cleanup
+		log.Printf("[tun] ready: system TCP traffic is routed through %s", defaultTunName)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
@@ -226,5 +260,64 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	carr.Shutdown(shutdownCtx)
 	shutdownCancel()
+	if tunCleanup != nil {
+		tunCleanup()
+	}
 	cancel()
+}
+
+func ensureTunPrivileges() {
+	if os.Geteuid() == 0 {
+		return
+	}
+
+	sudoCmd := "sudo " + shellQuoteArgs(os.Args)
+	if !stdinIsTerminal() {
+		log.Fatalf("-tun requires root/CAP_NET_ADMIN. Run: %s", sudoCmd)
+	}
+
+	sudoPath, err := exec.LookPath("sudo")
+	if err != nil {
+		log.Fatalf("-tun requires root/CAP_NET_ADMIN and sudo was not found. Run as root: %s", shellQuoteArgs(os.Args))
+	}
+
+	log.Printf("[tun] re-executing with sudo for TUN, route, and DNS setup")
+	args := append([]string{"sudo"}, os.Args...)
+	if err := syscall.Exec(sudoPath, args, os.Environ()); err != nil {
+		log.Fatalf("sudo exec failed: %v", err)
+	}
+}
+
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+func shellQuoteArgs(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "" {
+			quoted = append(quoted, "''")
+			continue
+		}
+		if strings.IndexFunc(arg, func(r rune) bool { return !isShellSafeRune(r) }) == -1 {
+			quoted = append(quoted, arg)
+			continue
+		}
+		quoted = append(quoted, "'"+strings.ReplaceAll(arg, "'", "'\\''")+"'")
+	}
+	return strings.Join(quoted, " ")
+}
+
+func isShellSafeRune(r rune) bool {
+	if r >= 'a' && r <= 'z' {
+		return true
+	}
+	if r >= 'A' && r <= 'Z' {
+		return true
+	}
+	if r >= '0' && r <= '9' {
+		return true
+	}
+	return strings.ContainsRune("/-_.=:,+%@~", r)
 }
