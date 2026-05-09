@@ -218,17 +218,16 @@ func main() {
 
 func allScenarios() []scenario {
 	// Sizes are tuned so a full run completes in ~90 s on a quiet laptop while
-	// still being big enough to amortise carrier setup. Throughput numbers are
-	// dominated by ActiveDrainWindow (~350 ms per HTTP round) — bigger payloads
-	// don't change the ratio, just inflate wall clock.
+	// still being big enough to amortise carrier setup.
 	return []scenario{
 		{"throughput_up_1MB_1session", scenarioThroughputUp(1 * 1024 * 1024)},
 		{"throughput_up_8MB_1session", scenarioThroughputUp(8 * 1024 * 1024)},
 		{"throughput_up_8MB_4sessions", scenarioThroughputUpConcurrent(8*1024*1024, 4)},
 		{"throughput_down_8MB_1session", scenarioThroughputDown(8 * 1024 * 1024)},
 		{"ttfb_p50_p95", scenarioTTFB(50)},
+		{"browser_fanout_40sessions", scenarioBrowserFanout(40)},
 		{"sessions_per_sec", scenarioSessionsPerSec(10 * time.Second)},
-		{"idle_overhead_15s", scenarioIdleOverhead(15 * time.Second, 50)},
+		{"idle_overhead_15s", scenarioIdleOverhead(15*time.Second, 50)},
 	}
 }
 
@@ -382,6 +381,62 @@ func scenarioTTFB(n int) func(context.Context, *runEnv) (any, error) {
 	}
 }
 
+func scenarioBrowserFanout(n int) func(context.Context, *runEnv) (any, error) {
+	return func(ctx context.Context, env *runEnv) (any, error) {
+		type sample struct {
+			durUS int64
+			err   error
+		}
+		results := make(chan sample, n)
+		t0 := time.Now()
+		for i := 0; i < n; i++ {
+			go func(i int) {
+				conn, err := env.dialer.Dial("tcp", sinkEcho)
+				if err != nil {
+					results <- sample{err: fmt.Errorf("dial[%d]: %w", i, err)}
+					return
+				}
+				defer conn.Close()
+				start := time.Now()
+				payload := []byte{byte('a' + i%26), byte('A' + i%26), byte('0' + i%10)}
+				buf := make([]byte, len(payload))
+				if _, err := conn.Write(payload); err != nil {
+					results <- sample{err: fmt.Errorf("write[%d]: %w", i, err)}
+					return
+				}
+				if _, err := io.ReadFull(conn, buf); err != nil {
+					results <- sample{err: fmt.Errorf("read[%d]: %w", i, err)}
+					return
+				}
+				results <- sample{durUS: time.Since(start).Microseconds()}
+			}(i)
+		}
+
+		samples := make([]int64, 0, n)
+		var firstErr error
+		for i := 0; i < n; i++ {
+			res := <-results
+			if res.err != nil && firstErr == nil {
+				firstErr = res.err
+			}
+			if res.err == nil {
+				samples = append(samples, res.durUS)
+			}
+		}
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		total := time.Since(t0)
+		return map[string]any{
+			"sessions":           n,
+			"duration_ms":        total.Milliseconds(),
+			"per_session_p50_us": percentile(samples, 50),
+			"per_session_p95_us": percentile(samples, 95),
+			"per_session_p99_us": percentile(samples, 99),
+		}, nil
+	}
+}
+
 func scenarioSessionsPerSec(d time.Duration) func(context.Context, *runEnv) (any, error) {
 	return func(ctx context.Context, env *runEnv) (any, error) {
 		end := time.Now().Add(d)
@@ -458,13 +513,13 @@ func scenarioIdleOverhead(d time.Duration, sessions int) func(context.Context, *
 			}
 		}
 		return map[string]any{
-			"sessions":         sessions,
-			"duration_ms":      d.Milliseconds(),
-			"samples":          len(clientCPU),
-			"client_cpu_mean":  round2(meanFloat(clientCPU)),
-			"client_cpu_max":   round2(maxFloat(clientCPU)),
-			"server_cpu_mean":  round2(meanFloat(serverCPU)),
-			"server_cpu_max":   round2(maxFloat(serverCPU)),
+			"sessions":        sessions,
+			"duration_ms":     d.Milliseconds(),
+			"samples":         len(clientCPU),
+			"client_cpu_mean": round2(meanFloat(clientCPU)),
+			"client_cpu_max":  round2(maxFloat(clientCPU)),
+			"server_cpu_mean": round2(meanFloat(serverCPU)),
+			"server_cpu_max":  round2(maxFloat(serverCPU)),
 		}, nil
 	}
 }

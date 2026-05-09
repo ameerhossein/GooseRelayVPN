@@ -441,7 +441,7 @@ What the client does for you automatically:
 | `socks_user` | *(optional)* | SOCKS5 username (RFC 1929). When set, clients must authenticate or the connection is rejected. Must be paired with `socks_pass` — set both or neither. |
 | `socks_pass` | *(optional)* | SOCKS5 password paired with `socks_user`. |
 | `coalesce_step_ms` | `0` (off) | Adaptive uplink coalescing. Set it to a positive number to make the first kick of a burst of TX operations wait a little for more operations; each new operation resets the timer. This trades a bit of latency for fewer Apps Script calls. A good starting range is 20-40 ms. Set it to `0` to turn coalescing off. The internal safety cap is derived automatically from this value. |
-| `idle_slots_per_bucket` | `1` | Download-throughput tuning. The carrier holds this many concurrent idle long-polls open per account bucket to receive downstream pushes. Default `1` is the safe baseline established by issue #56's fix. Raise to `2` if each Google account has 2+ deployments — this may increase download throughput; leave at `1` if each account has only one deployment (raising it would put 2 simultaneous polls on a single deployment URL, which is more likely to trip Apps Script's per-account concurrency cap). Max `3`; values above are rejected. |
+| `idle_slots_per_bucket` | `1` | Download-throughput tuning. The carrier holds this many concurrent RX long-polls open per account bucket to receive downstream pushes. Default `1` is the safe baseline and spends about 10,800 idle calls/day/account when continuously connected; `2` is about 21,600/day/account before active traffic, so use it only when quota headroom is acceptable. Max `3`; values above are rejected. |
 
 ### Server (`server_config.json`)
 
@@ -479,13 +479,13 @@ Key invariants:
 - **Authentication = AES-GCM tag.** No shared password, no certificates. Frames that fail `Open()` are dropped silently.
 - **Apps Script never sees plaintext.** The script is a ~30-line forwarder; the AES key lives only on your machine and the VPS.
 - **DNS travels through the tunnel.** The SOCKS5 server uses a no-op resolver; use `socks5h://` so DNS is resolved at the exit, not locally.
-- **Long-poll, full-duplex.** The VPS holds each request open for up to 8s waiting for downstream bytes; the client runs **4 concurrent poll workers per labeled `account` bucket** in `script_keys` (default; scales further with `idle_slots_per_bucket`) — so 1 account = 4 workers, 2 accounts = 8 workers, 3 accounts = 12 workers, regardless of how many deployment IDs each account has. The bucket model exists because Apps Script's per-second concurrency cap is per-account; scaling workers by deployment count instead caused users with multiple IDs under one account to see Apps Script HTML error pages mid-session. Downstream frames are coalesced in a small (~25 ms) window so streaming workloads send fewer, larger HTTP responses.
+- **Split-lane long-poll.** Empty RX batches hold a standing long-poll for up to 8s waiting for downstream bytes; TX batches carrying client frames return quickly after a tiny opportunistic drain. The client runs **4 concurrent poll workers per labeled `account` bucket** in `script_keys` (default; scales further with `idle_slots_per_bucket`) — so 1 account = 4 workers, 2 accounts = 8 workers, 3 accounts = 12 workers, regardless of how many deployment IDs each account has. The bucket model exists because Apps Script's per-second concurrency cap is per-account; scaling workers by deployment count instead caused users with multiple IDs under one account to see Apps Script HTML error pages mid-session. Downstream frames are coalesced in a small (~25 ms) window so streaming workloads send fewer, larger HTTP responses.
 - **Health-aware multi-deployment.** When `script_keys` lists more than one deployment, the client picks endpoints in round-robin and exponentially blacklists any that misbehave; one same-poll retry is attempted on a fresh deployment so transient failures don't drop traffic.
 
 ### Wire format
 
 - **Frame** (plaintext, inside the sealed batch): `session_id (16) || seq (u64 BE) || flags (u8) || target_len (u8) || target || payload_len (u32 BE) || payload`
-- **Batch seal** (AES-GCM): the entire batch is sealed once — `nonce (12 bytes) || AES-GCM(u16 frame_count || [u32 frame_len || frame_bytes] …)` — one nonce and auth-tag per HTTP body, not per frame.
+- **Batch seal** (AES-GCM): the entire batch is sealed once — `nonce (12 bytes) || AES-GCM(flags || client_id || u16 frame_count || [u32 frame_len || frame_bytes] …)` — one nonce and auth-tag per HTTP body, not per frame. The encrypted `flags` byte carries compression plus batch kind (`legacy`, `tx`, or `rx`).
 - **HTTP body**: `base64(nonce || ciphertext+tag)`, base64 so it survives Apps Script's `ContentService` text round-trip.
 
 ---

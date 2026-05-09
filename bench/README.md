@@ -38,10 +38,11 @@ into your pre-tag flow when you're ready.
 | `throughput_up_8MB_4sessions` | 4 concurrent sessions, 8 MB each | `mb_per_sec` |
 | `throughput_down_8MB_1session` | Single session, 8 MB download from source sink | `mb_per_sec` |
 | `ttfb_p50_p95` | 50 sequential 1-byte echoes, latency percentiles | `p50_us`, `p95_us`, `p99_us` |
+| `browser_fanout_40sessions` | 40 concurrent short echo sessions, similar to a web page asset burst | `duration_ms`, `per_session_p95_us` |
 | `sessions_per_sec` | Open/close churn against quick sink for 10 s | `per_sec` |
 | `idle_overhead_15s` | 50 idle echo connections; sample CPU% every 500 ms | `client_cpu_mean`, `server_cpu_mean` |
 
-Throughput numbers are bounded by `ActiveDrainWindow` (90 ms) — every active HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 22 MB/s before Apps Script/network overhead. Sizes above are tuned so the full suite finishes in ~90 s.
+Legacy active batches are bounded by `ActiveDrainWindow` (90 ms). Split-lane TX batches use a smaller opportunistic wait, while RX batches hold the long-poll window for downstream push. Sizes above are tuned so the full suite finishes in ~90 s.
 
 ## Layout
 

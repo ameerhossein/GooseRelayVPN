@@ -443,7 +443,7 @@ nano client_config.json
 | `socks_user` | *(اختیاری)* | نام کاربری SOCKS5 (RFC 1929). وقتی تنظیم شود، کلاینت‌ها باید احراز هویت کنند وگرنه اتصال رد می‌شود. باید همراه با `socks_pass` تنظیم شود — هر دو با هم یا هیچ‌کدام. |
 | `socks_pass` | *(اختیاری)* | رمز SOCKS5 متناظر با `socks_user`. |
 | `coalesce_step_ms` | `0` (خاموش) | کوآلِسسِ تطبیقی برای آپلینک. وقتی مقدارش را `> 0` بگذارید، اولین kick یک burst کمی برای عملیات‌های بعدی صبر می‌کند؛ هر عملیات جدید تایمر را ریست می‌کند. این کار با کمی تأخیر، تعداد فراخوانی‌های Apps Script را کمتر می‌کند. بازهٔ شروع خوب ۲۰ تا ۴۰ میلی‌ثانیه است. مقدار `0` یعنی خاموش. سقف ایمنی داخلی به‌صورت خودکار از همین مقدار ساخته می‌شود و در config دیده نمی‌شود. |
-| `idle_slots_per_bucket` | `1` | تنظیم throughput دانلود. کلاینت به ازای هر «bucket» اکانت این تعداد long-poll بی‌کار همزمان باز نگه می‌دارد تا push دانلود را دریافت کند. پیش‌فرض `1` همان baseline ایمنِ fix شدهٔ issue #۵۶ است. اگر هر اکانت گوگل ۲ یا بیشتر deployment دارد، روی `2` بگذارید — این کار ممکن است throughput دانلود را افزایش دهد؛ اگر هر اکانت فقط یک deployment دارد روی `1` بگذارید (افزایش معنی‌اش این است که ۲ poll همزمان روی یک URL deployment می‌رود که احتمال برخورد با concurrency cap هر اکانت در Apps Script را بالا می‌برد). حداکثر `3`؛ بیشتر از این رد می‌شود. |
+| `idle_slots_per_bucket` | `1` | تنظیم throughput دانلود. کلاینت به ازای هر «bucket» اکانت این تعداد long-poll RX همزمان باز نگه می‌دارد تا push دانلود را دریافت کند. پیش‌فرض `1` baseline ایمن است و اگر دائم وصل باشید حدود ۱۰٬۸۰۰ call/day/account مصرف idle دارد؛ مقدار `2` حدود ۲۱٬۶۰۰ call/day/account قبل از ترافیک active مصرف می‌کند، پس فقط وقتی quota کافی دارید استفاده شود. حداکثر `3`؛ بیشتر از این رد می‌شود. |
 
 ### سرور (`server_config.json`)
 
@@ -481,13 +481,13 @@ nano client_config.json
 - **احراز هویت = تگ AES-GCM.** هیچ رمز عبور یا گواهی مشترکی نیست. فریم‌هایی که `Open()` آن‌ها fail شود بی‌صدا drop می‌شوند.
 - **Apps Script هرگز متن خام را نمی‌بیند.** اسکریپت یک forwarder ~۳۰ خطی است؛ کلید AES فقط روی کامپیوتر شما و VPS شماست.
 - **DNS از تونل عبور می‌کند.** سرور SOCKS5 از یک resolver خنثی استفاده می‌کند؛ از `socks5h://` استفاده کنید تا DNS در نقطه خروج resolve شود نه محلی.
-- **Long-poll تمام‌دوطرفه.** VPS هر درخواست را تا ۸ ثانیه باز نگه می‌دارد؛ کلاینت **۴ worker موازی به ازای هر «bucket» اکانت برچسب‌خورده** در `script_keys` اجرا می‌کند (پیش‌فرض؛ با `idle_slots_per_bucket` می‌توان بیشتر کرد) — یعنی ۱ اکانت = ۴ worker، ۲ اکانت = ۸ worker، ۳ اکانت = ۱۲ worker، فارغ از اینکه هر اکانت چند Deployment ID دارد. مدل bucket به این دلیل وجود دارد که per-second concurrency cap در Apps Script per-account است؛ اسکیل کردن worker بر اساس تعداد deployment باعث می‌شد کاربرانی که چند ID زیر یک اکانت دارند وسط جلسه با صفحات HTML خطای Apps Script مواجه شوند. فریم‌های downstream در یک پنجره کوچک (~۲۵ میلی‌ثانیه) coalesce می‌شوند تا برای استریم‌ها HTTP پاسخ‌های کمتر و بزرگ‌تر ساخته شود.
+- **Long-poll با مسیر جداگانه TX/RX.** batchهای خالی RX تا ۸ ثانیه باز می‌مانند تا downstream را بگیرند؛ batchهای TX که فریم‌های کلاینت را حمل می‌کنند بعد از یک drain خیلی کوتاه سریع برمی‌گردند. کلاینت **۴ worker موازی به ازای هر «bucket» اکانت برچسب‌خورده** در `script_keys` اجرا می‌کند (پیش‌فرض؛ با `idle_slots_per_bucket` می‌توان بیشتر کرد) — یعنی ۱ اکانت = ۴ worker، ۲ اکانت = ۸ worker، ۳ اکانت = ۱۲ worker، فارغ از اینکه هر اکانت چند Deployment ID دارد. مدل bucket به این دلیل وجود دارد که per-second concurrency cap در Apps Script per-account است؛ اسکیل کردن worker بر اساس تعداد deployment باعث می‌شد کاربرانی که چند ID زیر یک اکانت دارند وسط جلسه با صفحات HTML خطای Apps Script مواجه شوند. فریم‌های downstream در یک پنجره کوچک (~۲۵ میلی‌ثانیه) coalesce می‌شوند تا برای استریم‌ها HTTP پاسخ‌های کمتر و بزرگ‌تر ساخته شود.
 - **چند deployment سلامت‌محور.** وقتی `script_keys` بیش از یک deployment دارد، کلاینت endpointها را round-robin انتخاب می‌کند و هر کدام که بد رفتار کند به‌صورت نمایی blacklist می‌کند؛ یک retry در همان poll روی deployment سالم انجام می‌شود تا خطاهای موقتی ترافیک را drop نکنند.
 
 ### فرمت wire
 
 - **Frame** (plaintext، داخل batch مهر و موم‌شده): `session_id (16) || seq (u64 BE) || flags (u8) || target_len (u8) || target || payload_len (u32 BE) || payload`
-- **Batch seal** (AES-GCM): کل batch یک‌بار seal می‌شود — `nonce (12 bytes) || AES-GCM(u16 frame_count || [u32 frame_len || frame_bytes] …)` — یک nonce و auth-tag به ازای هر HTTP body، نه به ازای هر frame.
+- **Batch seal** (AES-GCM): کل batch یک‌بار seal می‌شود — `nonce (12 bytes) || AES-GCM(flags || client_id || u16 frame_count || [u32 frame_len || frame_bytes] …)` — یک nonce و auth-tag به ازای هر HTTP body، نه به ازای هر frame. بایت رمزنگاری‌شده `flags` هم compression و هم نوع batch (`legacy`، `tx` یا `rx`) را حمل می‌کند.
 - **HTTP body**: `base64(nonce || ciphertext+tag)`، base64 برای اینکه round-trip متنی `ContentService` را سالم عبور دهد.
 
 ---

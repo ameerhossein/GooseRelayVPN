@@ -46,6 +46,20 @@ func invokeExitTunnel(tb testing.TB, s *Server, c *frame.Crypto, frames []*frame
 	if err != nil {
 		tb.Fatalf("encode request: %v", err)
 	}
+	return invokeExitTunnelBody(tb, s, body)
+}
+
+func invokeExitTunnelKind(tb testing.TB, s *Server, c *frame.Crypto, clientID [frame.ClientIDLen]byte, frames []*frame.Frame, kind byte) time.Duration {
+	tb.Helper()
+	body, err := frame.EncodeBatchWithKind(c, clientID, frames, kind)
+	if err != nil {
+		tb.Fatalf("encode request: %v", err)
+	}
+	return invokeExitTunnelBody(tb, s, body)
+}
+
+func invokeExitTunnelBody(tb testing.TB, s *Server, body []byte) time.Duration {
+	tb.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	t0 := time.Now()
@@ -105,6 +119,31 @@ func TestExitDrainWindow_ActiveBatchUsesShortWindow(t *testing.T) {
 	}})
 	if elapsed > ActiveDrainWindow+350*time.Millisecond {
 		t.Fatalf("active batch waited too long: %v", elapsed)
+	}
+}
+
+func TestExitDrainWindow_TXBatchUsesSplitLaneWindow(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+	target, closeFn := startSilentServer(t)
+	defer closeFn()
+	elapsed := invokeExitTunnelKind(t, s, c, [frame.ClientIDLen]byte{0x01}, []*frame.Frame{{
+		SessionID: [frame.SessionIDLen]byte{1},
+		Flags:     frame.FlagSYN,
+		Target:    target,
+		Payload:   []byte("PING"),
+	}}, frame.BatchKindTX)
+	if elapsed > TXDrainWindow+150*time.Millisecond {
+		t.Fatalf("tx batch waited too long: %v", elapsed)
+	}
+}
+
+func TestExitDrainWindow_RXBatchUsesLongPollWindow(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+	elapsed := invokeExitTunnelKind(t, s, c, [frame.ClientIDLen]byte{0x01}, nil, frame.BatchKindRX)
+	if elapsed < LongPollWindow-500*time.Millisecond {
+		t.Fatalf("rx poll returned too quickly: %v", elapsed)
 	}
 }
 
@@ -183,6 +222,67 @@ func invokeAsClient(tb testing.TB, s *Server, c *frame.Crypto, clientID [frame.C
 		tb.Fatalf("decode response: %v", err)
 	}
 	return out
+}
+
+func invokeAsClientKind(tb testing.TB, s *Server, c *frame.Crypto, clientID [frame.ClientIDLen]byte, frames []*frame.Frame, kind byte) []*frame.Frame {
+	tb.Helper()
+	body, err := frame.EncodeBatchWithKind(c, clientID, frames, kind)
+	if err != nil {
+		tb.Fatalf("encode: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleTunnel(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if len(respBody) == 0 {
+		return nil
+	}
+	_, out, err := frame.DecodeBatch(c, respBody)
+	if err != nil {
+		tb.Fatalf("decode response: %v", err)
+	}
+	return out
+}
+
+func TestExitSplitLane_TXWakesStandingRXPoll(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+
+	marker := []byte("SPLIT-LANE-MARKER")
+	upstream, closeUpstream := startMarkerServer(t, marker, 50*time.Millisecond)
+	defer closeUpstream()
+
+	clientID := [frame.ClientIDLen]byte{0xA5}
+	sid := [frame.SessionIDLen]byte{0x5A}
+	rxDone := make(chan []*frame.Frame, 1)
+	go func() {
+		rxDone <- invokeAsClientKind(t, s, c, clientID, nil, frame.BatchKindRX)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	txStart := time.Now()
+	txFrames := invokeAsClientKind(t, s, c, clientID, []*frame.Frame{{
+		SessionID: sid,
+		Flags:     frame.FlagSYN,
+		Target:    upstream,
+	}}, frame.BatchKindTX)
+	if elapsed := time.Since(txStart); elapsed > TXDrainWindow+150*time.Millisecond {
+		t.Fatalf("tx batch waited too long: %v", elapsed)
+	}
+	if len(txFrames) != 0 {
+		t.Fatalf("tx response unexpectedly carried %d downstream frame(s)", len(txFrames))
+	}
+
+	select {
+	case got := <-rxDone:
+		if len(got) != 1 || !bytes.Equal(got[0].Payload, marker) {
+			t.Fatalf("rx poll got %#v, want marker %q", got, marker)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rx poll was not woken by tx-produced downstream data")
+	}
 }
 
 // TestExit_MultiClient_SessionIsolation is the regression test for issue #23:

@@ -114,6 +114,13 @@ var (
 )
 
 const (
+	BatchKindLegacy byte = 0x00
+	BatchKindTX     byte = 0x10
+	BatchKindRX     byte = 0x20
+
+	batchCompressionMask = byte(0x0f)
+	batchKindMask        = byte(0xf0)
+
 	// batchFlagRaw marks an uncompressed plaintext payload.
 	batchFlagRaw = byte(0x00)
 	// batchFlagFlate is the legacy DEFLATE flag. No longer emitted by this
@@ -150,8 +157,15 @@ const (
 // not survive the hop. Sealing it under AES-GCM also means a passive observer
 // of the relay traffic cannot tell two clients apart by their IDs.
 func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte, error) {
+	return EncodeBatchWithKind(c, clientID, frames, BatchKindLegacy)
+}
+
+func EncodeBatchWithKind(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame, kind byte) ([]byte, error) {
 	if len(frames) > 0xFFFF {
 		return nil, fmt.Errorf("batch: too many frames: %d", len(frames))
+	}
+	if kind&batchKindMask != kind {
+		return nil, fmt.Errorf("batch: invalid kind 0x%02x", kind)
 	}
 
 	// Marshal all frames first so we know the exact plaintext size.
@@ -213,13 +227,13 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 		compressed := enc.EncodeAll(plain[1:], plain[:1:1])
 		zstdEncPool.Put(enc)
 		if len(compressed)-1 < len(plain)-1 {
-			compressed[0] = batchFlagZstd
+			compressed[0] = kind | batchFlagZstd
 			sealInput = compressed
 		} else {
-			plain[0] = batchFlagRaw
+			plain[0] = kind | batchFlagRaw
 		}
 	} else {
-		plain[0] = batchFlagRaw
+		plain[0] = kind | batchFlagRaw
 	}
 
 	sealed, err := c.Seal(sealInput)
@@ -242,9 +256,14 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 // payloads point into the decompressed buffer, which is also heap-allocated and
 // must not be modified by callers.
 func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
+	clientID, frames, _, err := DecodeBatchWithKind(c, body)
+	return clientID, frames, err
+}
+
+func DecodeBatchWithKind(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, byte, error) {
 	var zeroID [ClientIDLen]byte
 	if len(body) == 0 {
-		return zeroID, nil, nil
+		return zeroID, nil, BatchKindLegacy, nil
 	}
 	// bytes.TrimSpace returns a subslice (no alloc); Decode writes into a
 	// pre-allocated buffer — together this is one allocation instead of three.
@@ -256,23 +275,30 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	sealed := make([]byte, b64Encoding.DecodedLen(len(trimmed)))
 	n, err := b64Encoding.Decode(sealed, trimmed)
 	if err != nil {
-		return zeroID, nil, fmt.Errorf("batch: base64 decode: %w", err)
+		return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: base64 decode: %w", err)
 	}
 	sealed = sealed[:n]
 
 	rawPlain, err := c.Open(sealed)
 	if err != nil {
-		return zeroID, nil, fmt.Errorf("batch: open: %w", err)
+		return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: open: %w", err)
 	}
 
 	// Decode the leading flags byte. Both peers must run the same version;
 	// an unrecognised flag byte is rejected so a protocol mismatch surfaces
 	// immediately rather than producing silent corruption.
 	if len(rawPlain) == 0 {
-		return zeroID, nil, errors.New("batch: empty plaintext")
+		return zeroID, nil, BatchKindLegacy, errors.New("batch: empty plaintext")
 	}
 	var plain []byte
-	switch rawPlain[0] {
+	kind := rawPlain[0] & batchKindMask
+	compression := rawPlain[0] & batchCompressionMask
+	switch kind {
+	case BatchKindLegacy, BatchKindTX, BatchKindRX:
+	default:
+		return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: unknown kind 0x%02x", kind)
+	}
+	switch compression {
 	case batchFlagRaw:
 		plain = rawPlain[1:]
 	case batchFlagFlate:
@@ -280,7 +306,7 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 		r := flate.NewReader(bytes.NewReader(rawPlain[1:]))
 		var buf bytes.Buffer
 		if _, err := io.Copy(&buf, r); err != nil {
-			return zeroID, nil, fmt.Errorf("batch: flate decompress: %w", err)
+			return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: flate decompress: %w", err)
 		}
 		r.Close()
 		plain = buf.Bytes()
@@ -289,15 +315,15 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 		decompressed, err := dec.DecodeAll(rawPlain[1:], nil)
 		zstdDecPool.Put(dec)
 		if err != nil {
-			return zeroID, nil, fmt.Errorf("batch: zstd decompress: %w", err)
+			return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: zstd decompress: %w", err)
 		}
 		plain = decompressed
 	default:
-		return zeroID, nil, fmt.Errorf("batch: unknown flags byte 0x%02x", rawPlain[0])
+		return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: unknown compression flag 0x%02x", compression)
 	}
 
 	if len(plain) < ClientIDLen+2 {
-		return zeroID, nil, errors.New("batch: short header")
+		return zeroID, nil, BatchKindLegacy, errors.New("batch: short header")
 	}
 	var clientID [ClientIDLen]byte
 	copy(clientID[:], plain[:ClientIDLen])
@@ -307,19 +333,19 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	frames := make([]*Frame, 0, count)
 	for i := 0; i < count; i++ {
 		if len(plain) < off+4 {
-			return zeroID, nil, errors.New("batch: short frame length")
+			return zeroID, nil, BatchKindLegacy, errors.New("batch: short frame length")
 		}
 		flen := int(binary.BigEndian.Uint32(plain[off:]))
 		off += 4
 		if len(plain) < off+flen {
-			return zeroID, nil, errors.New("batch: short frame body")
+			return zeroID, nil, BatchKindLegacy, errors.New("batch: short frame body")
 		}
 		f, _, err := Unmarshal(plain[off : off+flen])
 		if err != nil {
-			return zeroID, nil, fmt.Errorf("batch: unmarshal frame %d: %w", i, err)
+			return zeroID, nil, BatchKindLegacy, fmt.Errorf("batch: unmarshal frame %d: %w", i, err)
 		}
 		frames = append(frames, f)
 		off += flen
 	}
-	return clientID, frames, nil
+	return clientID, frames, kind, nil
 }

@@ -6,16 +6,16 @@ import (
 )
 
 const (
-	ProtocolVersion = 1
+	ProtocolVersion = 2
 	ProbePrefix     = "goose_version_probe:v1"
 )
 
 type VersionInfo struct {
-	OK             bool     `json:"ok"`
-	Protocol       int      `json:"protocol"`
-	ServerVersion  string   `json:"server_version"`
-	MaxFramePayload int     `json:"max_frame_payload"`
-	Features       []string `json:"features"`
+	OK              bool     `json:"ok"`
+	Protocol        int      `json:"protocol"`
+	ServerVersion   string   `json:"server_version"`
+	MaxFramePayload int      `json:"max_frame_payload"`
+	Features        []string `json:"features"`
 }
 
 type VersionProbe struct {

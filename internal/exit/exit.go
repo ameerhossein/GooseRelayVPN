@@ -57,6 +57,11 @@ const (
 	// improves throughput for video streams under higher RTT links.
 	coalesceWindow = 25 * time.Millisecond
 
+	// TXDrainWindow is the small opportunistic wait for split-lane TX batches.
+	// Downstream delivery is handled by standing RX polls, so TX requests should
+	// not camp on the Apps Script execution slot just to wait for a response.
+	TXDrainWindow = 10 * time.Millisecond
+
 	// coalesceWindowBusy is used when many sessions are active concurrently:
 	// under high fan-out the next batch fills within a few ms, so 25ms of
 	// extra accumulation is pure tail latency. Only applied when a) the
@@ -281,7 +286,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID, rxFrames, err := frame.DecodeBatch(s.aead, body)
+	clientID, rxFrames, batchKind, err := frame.DecodeBatchWithKind(s.aead, body)
 	if err != nil {
 		s.stats.decodeFailures.Add(1)
 		// Decode failure on the very first batch from a client almost always
@@ -330,7 +335,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// Active batches use a shorter wait to avoid stalling unrelated sessions,
 	// while empty polls keep long-poll behavior for push responsiveness.
-	deadline := time.Now().Add(s.drainWindow(rxFrames))
+	deadline := time.Now().Add(s.drainWindow(rxFrames, batchKind))
 	for {
 		txFrames, urgent := s.drainAll(clientID, maxResponseBytesPreEncode)
 		if len(txFrames) > 0 {
@@ -405,7 +410,13 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) drainWindow(rxFrames []*frame.Frame) time.Duration {
+func (s *Server) drainWindow(rxFrames []*frame.Frame, batchKind byte) time.Duration {
+	switch batchKind {
+	case frame.BatchKindRX:
+		return LongPollWindow
+	case frame.BatchKindTX:
+		return TXDrainWindow
+	}
 	// Any non-empty client batch was a directed action (SYN, data, FIN, RST):
 	// the worker that posted it is blocked waiting for our response and has
 	// nothing else to do until we return. Use the short ActiveDrainWindow so
@@ -505,7 +516,7 @@ func (s *Server) queueRST(owner [frame.ClientIDLen]byte, sessionID [frame.Sessio
 }
 
 func (s *Server) queueVersionResponse(owner [frame.ClientIDLen]byte, sessionID [frame.SessionIDLen]byte) {
-	payload, err := protocol.EncodeVersionInfo(s.version, MaxFramePayload, []string{"zstd", "raw_base64"})
+	payload, err := protocol.EncodeVersionInfo(s.version, MaxFramePayload, []string{"zstd", "raw_base64", "split_lane"})
 	if err != nil {
 		payload = []byte("{\"ok\":false}")
 	}

@@ -242,6 +242,32 @@ func TestEncodeDecodeBatch_Compressed(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeBatch_WithKind(t *testing.T) {
+	c := newTestCrypto(t)
+	payload := bytes.Repeat([]byte("split lane payload "), 40)
+	frames := []*Frame{{SessionID: sid(1), Seq: 0, Flags: FlagSYN, Target: "example.com:443", Payload: payload}}
+	var clientID [ClientIDLen]byte
+	clientID[0] = 0x42
+
+	body, err := EncodeBatchWithKind(c, clientID, frames, BatchKindTX)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	gotClient, out, kind, err := DecodeBatchWithKind(c, body)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if kind != BatchKindTX {
+		t.Fatalf("kind=0x%02x want 0x%02x", kind, BatchKindTX)
+	}
+	if gotClient != clientID {
+		t.Fatalf("clientID mismatch: got %x want %x", gotClient, clientID)
+	}
+	if len(out) != 1 || !bytes.Equal(out[0].Payload, payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
 // TestZstdFlagEmitted verifies that batches large enough to compress are
 // sealed with batchFlagZstd (0x02) and not with the old batchFlagFlate (0x01).
 // It also checks that round-tripping through DecodeBatch produces identical

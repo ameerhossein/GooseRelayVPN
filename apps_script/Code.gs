@@ -11,7 +11,7 @@
 
 const RELAY_URL = 'http://YOUR.VPS.IP:8443/tunnel';
 const FORWARDER_VERSION = 1;
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 
 function doPost(e) {
   const payload = (e && e.postData && e.postData.contents) || '';

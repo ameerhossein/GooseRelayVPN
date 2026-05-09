@@ -280,6 +280,11 @@ func New(cfg Config) (*Client, error) {
 	numWorkers := (workersPerEndpoint + idleSlotsPerBucket - 1) * bucketCount
 	log.Printf("[carrier] %d worker(s) across %d account bucket(s) (%d endpoint(s)), %d idle slot(s)/bucket",
 		numWorkers, bucketCount, len(endpoints), idleSlotsPerBucket)
+	if idleSlotsPerBucket > 1 {
+		estimatedIdleCalls := idleSlotsPerBucket * int((24*time.Hour)/(8*time.Second))
+		log.Printf("[carrier] WARN: idle_slots_per_bucket=%d can spend about %d Apps Script calls/day/account while continuously connected; consumer accounts are commonly limited to about 20k/day",
+			idleSlotsPerBucket, estimatedIdleCalls)
+	}
 	if labeled == 0 && len(endpoints) > 1 {
 		log.Printf("[carrier] WARN: %d deployments configured with no account labels — treating as one bucket. "+
 			"If these deployments are under different Google accounts, label them in script_keys "+
@@ -525,7 +530,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		}
 	}()
 
-	body, err := frame.EncodeBatch(c.aead, c.clientID, frames)
+	batchKind := frame.BatchKindTX
+	if isIdlePoll {
+		batchKind = frame.BatchKindRX
+	}
+	body, err := frame.EncodeBatchWithKind(c.aead, c.clientID, frames, batchKind)
 	if err != nil {
 		log.Printf("[carrier] failed to prepare encrypted request batch: %v", err)
 		return false
